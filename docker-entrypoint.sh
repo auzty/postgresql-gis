@@ -136,6 +136,8 @@ if [ "$1" = 'postgres' ]; then
 		PGUSER="${PGUSER:-postgres}" \
 		pg_ctl -D "$PGDATA" -m fast -w stop
 
+    echo 'Add Shared Preload Libraries'
+    sed -i -e "s/.*shared_preload_libraries.*/shared_preload_libraries='timescaledb'/g" /var/lib/postgresql/data/postgresql.conf
 		echo
 		echo 'PostgreSQL init process complete; ready for start up.'
 		echo

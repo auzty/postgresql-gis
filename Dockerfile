@@ -47,6 +47,7 @@ RUN set -ex; \
 	apt-key list
 
 ENV PG_MAJOR 9.6
+ENV POSTGIS_MAJOR 2.3
 
 RUN echo 'deb http://apt.postgresql.org/pub/repos/apt/ jessie-pgdg main' $PG_MAJOR > /etc/apt/sources.list.d/pgdg.list
 
@@ -56,7 +57,9 @@ RUN apt-get update \
 	&& apt-get install -y \
 		postgresql-$PG_MAJOR \
 		postgresql-contrib-$PG_MAJOR \
-    postgis \
+    postgresql-9.6-postgis-2.3 \
+    wget \
+    postgresql-server-dev-$PG_MAJOR \
 	&& rm -rf /var/lib/apt/lists/*
 
 # make the sample config easier to munge (and "correct by default")
@@ -70,6 +73,11 @@ ENV PATH /usr/lib/postgresql/$PG_MAJOR/bin:$PATH
 ENV PGDATA /var/lib/postgresql/data
 RUN mkdir -p "$PGDATA" && chown -R postgres:postgres "$PGDATA" && chmod 777 "$PGDATA" # this 777 will be replaced by 700 at runtime (allows semi-arbitrary "--user" values)
 VOLUME /var/lib/postgresql/data
+
+# Add timescaledb
+RUN wget https://timescalereleases.blob.core.windows.net/debian/timescaledb-postgresql-9.6_0.9.1~debian7_amd64.deb && dpkg -i timescaledb-postgresql-9.6_0.9.1~debian7_amd64.deb && rm timescaledb-postgresql-9.6_0.9.1~debian7_amd64.deb 
+RUN echo "shared_preload_libraries = 'timescaledb'" >> /var/lib/postgresql/data/postgresql.conf
+# End timescaledb installing
 
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN ln -s usr/local/bin/docker-entrypoint.sh / # backwards compat
