@@ -93,6 +93,9 @@ if [ "$1" = 'postgres' ]; then
 
 		# internal start of server in order to allow set-up using psql-client
 		# does not listen on external TCP/IP and waits until start finishes
+#    echo 'Add Shared Preload Libraries'
+#    sed -i -e "s/.*shared_preload_libraries.*/shared_preload_libraries='timescaledb'/g" /var/lib/postgresql/data/postgresql.conf
+
 		PGUSER="${PGUSER:-postgres}" \
 		pg_ctl -D "$PGDATA" \
 			-o "-c listen_addresses='localhost'" \
@@ -136,8 +139,6 @@ if [ "$1" = 'postgres' ]; then
 		PGUSER="${PGUSER:-postgres}" \
 		pg_ctl -D "$PGDATA" -m fast -w stop
 
-    echo 'Add Shared Preload Libraries'
-    sed -i -e "s/.*shared_preload_libraries.*/shared_preload_libraries='timescaledb'/g" /var/lib/postgresql/data/postgresql.conf
 		echo
 		echo 'PostgreSQL init process complete; ready for start up.'
 		echo

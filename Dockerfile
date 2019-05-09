@@ -75,7 +75,7 @@ RUN mkdir -p "$PGDATA" && chown -R postgres:postgres "$PGDATA" && chmod 777 "$PG
 VOLUME /var/lib/postgresql/data
 
 # Add timescaledb
-RUN wget https://timescalereleases.blob.core.windows.net/debian/timescaledb-postgresql-9.6_0.9.1~debian7_amd64.deb && dpkg -i timescaledb-postgresql-9.6_0.9.1~debian7_amd64.deb && rm timescaledb-postgresql-9.6_0.9.1~debian7_amd64.deb 
+RUN wget https://timescalereleases.blob.core.windows.net/debian/timescaledb-postgresql-9.6_0.9.2~debian7_amd64.deb && dpkg -i timescaledb-postgresql-9.6_0.9.2~debian7_amd64.deb && rm timescaledb-postgresql-9.6_0.9.2~debian7_amd64.deb
 RUN echo "shared_preload_libraries = 'timescaledb'" >> /var/lib/postgresql/data/postgresql.conf
 # End timescaledb installing
 
