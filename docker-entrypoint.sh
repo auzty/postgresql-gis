@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -e
+set -Eeo pipefail
+# TODO swap to -Eeuo pipefail above (after handling all potentially-unset variables)
 
 # usage: file_env VAR [DEFAULT]
 #    ie: file_env 'XYZ_DB_PASSWORD' 'example'
@@ -38,10 +39,10 @@ if [ "$1" = 'postgres' ] && [ "$(id -u)" = '0' ]; then
 	chmod 775 /var/run/postgresql
 
 	# Create the transaction log directory before initdb is run (below) so the directory is owned by the correct user
-	if [ "$POSTGRES_INITDB_XLOGDIR" ]; then
-		mkdir -p "$POSTGRES_INITDB_XLOGDIR"
-		chown -R postgres "$POSTGRES_INITDB_XLOGDIR"
-		chmod 700 "$POSTGRES_INITDB_XLOGDIR"
+	if [ "$POSTGRES_INITDB_WALDIR" ]; then
+		mkdir -p "$POSTGRES_INITDB_WALDIR"
+		chown -R postgres "$POSTGRES_INITDB_WALDIR"
+		chmod 700 "$POSTGRES_INITDB_WALDIR"
 	fi
 
 	exec gosu postgres "$BASH_SOURCE" "$@"
@@ -54,18 +55,48 @@ if [ "$1" = 'postgres' ]; then
 
 	# look specifically for PG_VERSION, as it is expected in the DB dir
 	if [ ! -s "$PGDATA/PG_VERSION" ]; then
-		file_env 'POSTGRES_INITDB_ARGS'
-		if [ "$POSTGRES_INITDB_XLOGDIR" ]; then
-			export POSTGRES_INITDB_ARGS="$POSTGRES_INITDB_ARGS --xlogdir $POSTGRES_INITDB_XLOGDIR"
+		# "initdb" is particular about the current user existing in "/etc/passwd", so we use "nss_wrapper" to fake that if necessary
+		# see https://github.com/docker-library/postgres/pull/253, https://github.com/docker-library/postgres/issues/359, https://cwrap.org/nss_wrapper.html
+		if ! getent passwd "$(id -u)" &> /dev/null && [ -e /usr/lib/libnss_wrapper.so ]; then
+			export LD_PRELOAD='/usr/lib/libnss_wrapper.so'
+			export NSS_WRAPPER_PASSWD="$(mktemp)"
+			export NSS_WRAPPER_GROUP="$(mktemp)"
+			echo "postgres:x:$(id -u):$(id -g):PostgreSQL:$PGDATA:/bin/false" > "$NSS_WRAPPER_PASSWD"
+			echo "postgres:x:$(id -g):" > "$NSS_WRAPPER_GROUP"
 		fi
-		eval "initdb --username=postgres $POSTGRES_INITDB_ARGS"
+
+		file_env 'POSTGRES_USER' 'postgres'
+		file_env 'POSTGRES_PASSWORD'
+
+		file_env 'POSTGRES_INITDB_ARGS'
+		if [ "$POSTGRES_INITDB_WALDIR" ]; then
+			export POSTGRES_INITDB_ARGS="$POSTGRES_INITDB_ARGS --waldir $POSTGRES_INITDB_WALDIR"
+		fi
+		eval 'initdb --username="$POSTGRES_USER" --pwfile=<(echo "$POSTGRES_PASSWORD") '"$POSTGRES_INITDB_ARGS"
+
+		# unset/cleanup "nss_wrapper" bits
+		if [ "${LD_PRELOAD:-}" = '/usr/lib/libnss_wrapper.so' ]; then
+			rm -f "$NSS_WRAPPER_PASSWD" "$NSS_WRAPPER_GROUP"
+			unset LD_PRELOAD NSS_WRAPPER_PASSWD NSS_WRAPPER_GROUP
+		fi
 
 		# check password first so we can output the warning before postgres
 		# messes it up
-		file_env 'POSTGRES_PASSWORD'
-		if [ "$POSTGRES_PASSWORD" ]; then
-			pass="PASSWORD '$POSTGRES_PASSWORD'"
+		if [ -n "$POSTGRES_PASSWORD" ]; then
 			authMethod=md5
+
+			if [ "${#POSTGRES_PASSWORD}" -ge 100 ]; then
+				cat >&2 <<-'EOWARN'
+
+					WARNING: The supplied POSTGRES_PASSWORD is 100+ characters.
+
+					  This will not work if used via PGPASSWORD with "psql".
+
+					  https://www.postgresql.org/message-id/flat/E1Rqxp2-0004Qt-PL%40wrigleys.postgresql.org (BUG #6412)
+					  https://github.com/docker-library/postgres/issues/507
+
+				EOWARN
+			fi
 		else
 			# The - option suppresses leading tabs but *not* spaces. :)
 			cat >&2 <<-'EOWARN'
@@ -82,7 +113,6 @@ if [ "$1" = 'postgres' ]; then
 				****************************************************
 			EOWARN
 
-			pass=
 			authMethod=trust
 		fi
 
@@ -93,42 +123,38 @@ if [ "$1" = 'postgres' ]; then
 
 		# internal start of server in order to allow set-up using psql-client
 		# does not listen on external TCP/IP and waits until start finishes
-#    echo 'Add Shared Preload Libraries'
-#    sed -i -e "s/.*shared_preload_libraries.*/shared_preload_libraries='timescaledb'/g" /var/lib/postgresql/data/postgresql.conf
-
-		PGUSER="${PGUSER:-postgres}" \
+		PGUSER="${PGUSER:-$POSTGRES_USER}" \
 		pg_ctl -D "$PGDATA" \
-			-o "-c listen_addresses='localhost'" \
+			-o "-c listen_addresses=''" \
 			-w start
 
-		file_env 'POSTGRES_USER' 'postgres'
 		file_env 'POSTGRES_DB' "$POSTGRES_USER"
 
-		psql=( psql -v ON_ERROR_STOP=1 )
+		export PGPASSWORD="${PGPASSWORD:-$POSTGRES_PASSWORD}"
+		psql=( psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --no-password )
 
 		if [ "$POSTGRES_DB" != 'postgres' ]; then
-			"${psql[@]}" --username postgres <<-EOSQL
-				CREATE DATABASE "$POSTGRES_DB" ;
+			"${psql[@]}" --dbname postgres --set db="$POSTGRES_DB" <<-'EOSQL'
+				CREATE DATABASE :"db" ;
 			EOSQL
 			echo
 		fi
-
-		if [ "$POSTGRES_USER" = 'postgres' ]; then
-			op='ALTER'
-		else
-			op='CREATE'
-		fi
-		"${psql[@]}" --username postgres <<-EOSQL
-			$op USER "$POSTGRES_USER" WITH SUPERUSER $pass ;
-		EOSQL
-		echo
-
-		psql+=( --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" )
+		psql+=( --dbname "$POSTGRES_DB" )
 
 		echo
 		for f in /docker-entrypoint-initdb.d/*; do
 			case "$f" in
-				*.sh)     echo "$0: running $f"; . "$f" ;;
+				*.sh)
+					# https://github.com/docker-library/postgres/issues/450#issuecomment-393167936
+					# https://github.com/docker-library/postgres/pull/452
+					if [ -x "$f" ]; then
+						echo "$0: running $f"
+						"$f"
+					else
+						echo "$0: sourcing $f"
+						. "$f"
+					fi
+					;;
 				*.sql)    echo "$0: running $f"; "${psql[@]}" -f "$f"; echo ;;
 				*.sql.gz) echo "$0: running $f"; gunzip -c "$f" | "${psql[@]}"; echo ;;
 				*)        echo "$0: ignoring $f" ;;
@@ -136,13 +162,30 @@ if [ "$1" = 'postgres' ]; then
 			echo
 		done
 
-		PGUSER="${PGUSER:-postgres}" \
+		PGUSER="${PGUSER:-$POSTGRES_USER}" \
 		pg_ctl -D "$PGDATA" -m fast -w stop
+
+		unset PGPASSWORD
 
 		echo
 		echo 'PostgreSQL init process complete; ready for start up.'
 		echo
 	fi
 fi
+
+cp -R /tmp/pgbouncer /var/lib/postgresql/data/
+chown postgres:postgres /var/lib/postgresql/data/pgbouncer
+
+# set the pgbouncer config
+sed -i -e "s/user=.* /user=${POSTGRES_USER} /g"  /var/lib/postgresql/data/pgbouncer/pgbouncer.ini
+sed -i -e "s/password=.*$/password=${POSTGRES_PASSWORD}/g"  /var/lib/postgresql/data/pgbouncer/pgbouncer.ini
+#sed -i -e "s/admin_users.*$/admin_users = ${POSTGRES_USER}/g" /var/lib/postgresql/data/pgbouncer/pgbouncer.ini
+
+# create pgbouncer userlist
+MYMD5=`echo -n "${POSTGRES_PASSWORD}${POSTGRES_USER}" | md5sum | awk '{print $1}'`
+
+#echo "ikimunu hasile md5 === $MYMD5"
+
+echo "\"${POSTGRES_USER}\" \"md5${MYMD5}\"" > /var/lib/postgresql/data/pgbouncer/userlist.txt
 
 exec "$@"
